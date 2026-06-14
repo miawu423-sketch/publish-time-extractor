@@ -7,15 +7,23 @@ URL发布时间提取工具 - Web服务版
 
 from flask import Flask, render_template_string, request, jsonify, send_file
 import requests
-import io
+import pandas as pd
 import json
 import re
 from bs4 import BeautifulSoup
 from datetime import datetime
 import time
+import io
 import traceback
 from urllib.parse import urlparse
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+# Playwright 是可选依赖，不影响静态提取
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    PlaywrightTimeout = Exception  # fallback
 
 app = Flask(__name__)
 
@@ -985,6 +993,10 @@ HTML：
     
     def extract_with_browser(self, url, timeout=15000):
         """使用浏览器渲染页面后提取（每次创建新实例，避免线程问题）"""
+        if not PLAYWRIGHT_AVAILABLE:
+            return {'url': url, 'extracted_publish_time': None, 'raw_publish_time': None,
+                   'extraction_method': None, 'status': 'browser_unavailable',
+                   'page_score': None, 'page_features': 'Playwright未安装，仅支持静态提取'}
         playwright = None
         browser = None
         try:
@@ -1074,17 +1086,19 @@ HTML：
                 result, method_name = method(soup)
                 if result:
                     normalized_time = self.normalize_datetime(result)
+                    # normalize失败 → 继续尝试下一个方法
+                    if not normalized_time:
+                        continue
                     # 多重时间校验
-                    if normalized_time:
-                        # 校验1: 未来时间（可能是赛事时间）
-                        if self.is_future_time(normalized_time):
-                            continue
-                        # 校验2: 过于久远（可能是人物生日）
-                        if self.is_too_old(normalized_time):
-                            continue
-                        # 校验3: 页面访问时间（可能是JS生成的当前时间）
-                        if self.is_likely_access_time(normalized_time):
-                            continue
+                    # 校验1: 未来时间（可能是赛事时间）
+                    if self.is_future_time(normalized_time):
+                        continue
+                    # 校验2: 过于久远（可能是人物生日）
+                    if self.is_too_old(normalized_time):
+                        continue
+                    # 校验3: 页面访问时间（可能是JS生成的当前时间）
+                    if self.is_likely_access_time(normalized_time):
+                        continue
                     
                     return {
                         'url': url,
@@ -1506,6 +1520,35 @@ HTML：
         if re.match(r'^\d{2}-\d{2}-\d{2}', date_string):
             date_string = '20' + date_string
         
+        # 预处理：点号分隔日期 2026.06.14 系列格式
+        # 先处理带时间的（含中文星期的）：2026.06.14  星期日  12:00:59
+        dot_time_match = re.match(r'^(\d{4})\.(\d{1,2})\.(\d{1,2})\s+(?:\S+\s+)?(\d{2}:\d{2}(?::\d{2})?)', date_string)
+        if dot_time_match:
+            date_string = '%s-%02d-%02d %s' % (dot_time_match.group(1), int(dot_time_match.group(2)), int(dot_time_match.group(3)), dot_time_match.group(4))
+        else:
+            # 纯日期（可能带星期）：2026.06.14 星期日 或 2026.6.14星期日
+            dot_match = re.match(r'^(\d{4})\.(\d{1,2})\.(\d{1,2})', date_string)
+            if dot_match:
+                date_string = '%s-%02d-%02d' % (dot_match.group(1), int(dot_match.group(2)), int(dot_match.group(3)))
+        
+        # 预处理：倒序日期 DD-MM-YYYY（路虎等欧洲网站）
+        dmy_match = re.match(r'^(\d{2})-(\d{2})-(\d{4})$', date_string)
+        if dmy_match:
+            d, m, y = dmy_match.groups()
+            # 只有当第一组是合法日期（>12）才确认为DD-MM-YYYY
+            if int(d) > 12:
+                date_string = '%s-%s-%s' % (y, m, d)
+        
+        # 预处理：中文空格格式 "2026 年 6 月 14 日" → "2026年6月14日"
+        date_string = re.sub(r'(\d)\s+年\s*(\d)', r'\1年\2', date_string)
+        date_string = re.sub(r'(\d)\s+月\s*(\d)', r'\1月\2', date_string)
+        date_string = re.sub(r'(\d)\s+日', r'\1日', date_string)
+        
+        # 预处理：带括号的中文时间 "（最近更新时间：2026年4月）" → 提取其中的时间
+        bracket_match = re.search(r'(\d{4}年\d{1,2}月(?:\d{1,2}日)?)', date_string)
+        if bracket_match and ('（' in date_string or '(' in date_string):
+            date_string = bracket_match.group(1)
+        
         # 新华网格式: 202605/2313:03:30 → 2026-05-23 13:03:30
         xinhua_match = re.match(r'^(\d{4})(\d{2})/(\d{2})(\d{2}:\d{2}:\d{2})$', date_string)
         if xinhua_match:
@@ -1576,14 +1619,25 @@ HTML：
             except ValueError:
                 continue
         
-        # 如果所有格式都失败，尝试正则提取
+        # 如果所有格式都失败，尝试正则提取（支持仅有年月的情况）
         match = re.search(r'(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?\s*(\d{1,2})?[：:]?(\d{1,2})?[：:]?(\d{1,2})?', date_string)
+        if not match:
+            # 只有年月（如"2026年4月"）
+            match = re.search(r'(\d{4})[-/年](\d{1,2})月?$', date_string)
+            if match:
+                year, month, day = match.group(1), match.group(2), '1'
+                hour, minute, second = '00', '00', '00'
+                try:
+                    dt = datetime(int(year), int(month), int(day))
+                    return dt.strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    return None
         if match:
             year, month, day = match.group(1), match.group(2), match.group(3)
             hour = match.group(4) or '00'
             minute = match.group(5) or '00'
             second = match.group(6) or '00'
-            # 校验：月和日不能为0
+            # 校验：月不能为0；日为0时说明是无效原始日期（如2026-04-00），过滤掉
             if int(month) == 0 or int(day) == 0:
                 return None
             try:
@@ -1700,26 +1754,28 @@ HTML：
                 result, method_name = method(soup)
                 if result:
                     normalized_time = self.normalize_datetime(result)
+                    # normalize失败 → 继续尝试下一个方法
+                    if not normalized_time:
+                        continue
                     # 多重时间校验
-                    if normalized_time:
-                        # 校验1: 未来时间（可能是赛事时间）
-                        if self.is_future_time(normalized_time):
-                            continue
-                        # 校验2: 过于久远（可能是人物生日）
-                        if self.is_too_old(normalized_time):
-                            continue
-                        # 校验3: 页面访问时间（可能是JS生成的当前时间）
-                        if self.is_likely_access_time(normalized_time):
-                            continue
-                        
-                        # 检查精度：如果只到日（00:00:00结尾），暂存并继续找
-                        if normalized_time.endswith('00:00:00') and day_level_result is None:
-                            day_level_result = normalized_time
-                            day_level_method = method_name
-                            continue  # 不立即返回，继续往下找更精确的
-                        
-                        # 如果有暂存的日级结果，验证当前更精确的结果日期是否匹配
-                        if day_level_result and normalized_time[:10] == day_level_result[:10]:
+                    # 校验1: 未来时间（可能是赛事时间）
+                    if self.is_future_time(normalized_time):
+                        continue
+                    # 校验2: 过于久远（可能是人物生日）
+                    if self.is_too_old(normalized_time):
+                        continue
+                    # 校验3: 页面访问时间（可能是JS生成的当前时间）
+                    if self.is_likely_access_time(normalized_time):
+                        continue
+                    
+                    # 检查精度：如果只到日（00:00:00结尾），暂存并继续找
+                    if normalized_time.endswith('00:00:00') and day_level_result is None:
+                        day_level_result = normalized_time
+                        day_level_method = method_name
+                        continue  # 不立即返回，继续往下找更精确的
+                    
+                    # 如果有暂存的日级结果，验证当前更精确的结果日期是否匹配
+                    if day_level_result and normalized_time[:10] == day_level_result[:10]:
                             # 同一天，用更精确的
                             return {
                                 'url': url,
@@ -1731,15 +1787,15 @@ HTML：
                                 'page_features': None
                             }
                     
-                        return {
-                            'url': url,
-                            'extracted_publish_time': normalized_time,
-                            'raw_publish_time': result,
-                            'extraction_method': method_name,
-                            'status': 'success',
-                            'page_score': None,
-                            'page_features': None
-                        }
+                    return {
+                        'url': url,
+                        'extracted_publish_time': normalized_time,
+                        'raw_publish_time': result,
+                        'extraction_method': method_name,
+                        'status': 'success',
+                        'page_score': None,
+                        'page_features': None
+                    }
             
             # 所有方法都没找到更精确的，但有日级结果 → 返回日级
             if day_level_result:
@@ -1865,26 +1921,19 @@ def download():
     data = request.json
     results = data.get('results', [])
     
+    df = pd.DataFrame(results)
+    
     # 指定字段顺序
     desired_cols = ['url', 'extracted_publish_time', 'precision', 'status', 
                     'extraction_method', 'page_features', 'page_score', 'raw_publish_time']
-    
-    # 确定所有列
-    all_keys = set()
-    for r in results:
-        all_keys.update(r.keys())
-    cols = [c for c in desired_cols if c in all_keys]
-    remaining = [c for c in sorted(all_keys) if c not in cols]
-    final_cols = cols + remaining
+    # 只保留存在的列，按顺序排
+    cols = [c for c in desired_cols if c in df.columns]
+    # 加上其他未列出的列
+    remaining = [c for c in df.columns if c not in cols]
+    df = df[cols + remaining]
     
     output = io.BytesIO()
-    import csv as csv_mod
-    writer = csv_mod.writer(output)
-    # BOM for Excel
-    output.write(b'\xef\xbb\xbf')
-    writer.writerow(final_cols)
-    for r in results:
-        writer.writerow([r.get(c, '') for c in final_cols])
+    df.to_csv(output, index=False, encoding='utf-8-sig')
     output.seek(0)
     
     return send_file(
