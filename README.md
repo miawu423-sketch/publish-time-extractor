@@ -65,3 +65,15 @@ nohup /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 web_serv
 | ≤1天 | ~78% |
 
 > 注：动态页面（天气/彩票/金融数据）GT与工具提取存在时间差（GT为标注时，工具提取为当前最新），实际有效准确率更高。
+
+## 多设备协同
+
+```bash
+# 每次开始工作前，检查是否有远程更新（轻量，只比较commit hash，不下载文件）
+git fetch origin main && [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ] && git pull origin main
+
+# 每次完成工作后，提交并推送
+git add -A
+git commit -m "简述改动"
+git push origin main
+```
