@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# 运行时文件
+server.log
+test_batch.log
+test_batch.pid
+nohup.out
+
+# 临时文件
+*.tmp
+
+# 个人测试产出（CSV数据文件，体积大且无需版本控制）
+extracted_results.csv
+quick_test_results.csv
+p2_test_results.csv
+eval_result_seed*.csv
+eval_round_*.csv
+eval_0514_*.csv
+eval_v3_*.csv
+eval_compare_*.csv
+eval_empty_pt_*.csv
+
+# WorkBuddy 内部记忆（个人设备专属）
+.workbuddy/
